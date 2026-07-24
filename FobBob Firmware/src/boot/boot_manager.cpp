@@ -1,6 +1,7 @@
 #include "boot_manager.h"
 #include "nvs/nvs_manager.h"
 #include "buttons/buttons.h"
+#include "hardware/hardware.h"
 #include "config.h"
 #include <esp_sleep.h>
 #include <Arduino.h>
@@ -19,7 +20,15 @@ BootMode boot_determine_mode() {
 
     // EXT1 is always GPIO4 (FP_TOUCH_PIN, ANY_HIGH) — finger on sensor.
     // GPIO45 (TCA6408A INT) is not an RTC GPIO and cannot source EXT1 wakeup.
-    if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    //
+    // Confirm the line is genuinely driven before trusting the wakeup. IDF's
+    // ext1_wakeup_prepare() disables the pad's pull resistors whenever RTC_PERIPH
+    // is powered down in deep sleep (it is, by default), so GPIO4 floats whenever
+    // nothing is driving it — sensor unplugged, or its V_TOUCH rail down. Noise on
+    // a floating pad then fires ANY_HIGH on its own, and the device cycles
+    // sleep → FP screen → FP_MAX_ATTEMPTS comm errors → sleep, indefinitely.
+    // A rejected wake falls through to DEEP_SLEEP without lighting the display.
+    if (cause == ESP_SLEEP_WAKEUP_EXT1 && hardware_fp_touch_held(FP_TOUCH_CONFIRM_MS)) {
         return BootMode::FINGERPRINT_WAKE;
     }
 

@@ -765,12 +765,18 @@ static void loop_fp_wake() {
             s_mem_tick = 0;
             lv_mem_monitor_t lv_mon;
             lv_mem_monitor(&lv_mon);
-            Serial.printf("[MEM] heap free:%u min-ever:%u largest:%u | psram free:%u | lv_max:%lums\n",
+            // loopTask stack headroom (bytes, worst case since boot). ThorVG renders
+            // Lottie on THIS task (LV_OS_NONE + 1 draw unit), so the 8 KB Arduino
+            // default overflows on the first FP/BLE animation — see
+            // ARDUINO_LOOP_STACK_SIZE in platformio.ini. If this approaches 0 the
+            // device reboot-loops; raise the flag rather than trimming animations.
+            Serial.printf("[MEM] heap free:%u min-ever:%u largest:%u | psram free:%u | lv_max:%lums | loop stack free:%u\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                (unsigned long)(s_lv_max_us / 1000));
+                (unsigned long)(s_lv_max_us / 1000),
+                (unsigned)uxTaskGetStackHighWaterMark(nullptr));
             // LVGL has a fixed 64 KB pool with a while(1) malloc-fail handler — if
             // used_pct nears 100 the device hangs. Watch it here.
             Serial.printf("[MEM] lvgl used:%u%% free:%u frag:%u%%\n",
