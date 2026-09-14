@@ -1,5 +1,8 @@
 # Hardware design files (Altium CAD project — large/binary, not tracked)
-Hardware/
+# Leading slash anchors this to the repo root. Unanchored it matched at any
+# depth, which silently excluded the firmware's src/hardware/ directory too
+# (git is case-insensitive on Windows).
+/Hardware/
 
 # PlatformIO (firmware)
 .pio/
