@@ -499,6 +499,7 @@ struct FpVerifyResult_t {
     uint16_t    v_start;   // pack mV before the sensor was powered
     uint16_t    v_init;    // pack mV immediately after fp_init()
     uint16_t    v_min;     // lowest pack mV seen while the sensor was active
+    bool        touch;     // did the sensor's own TOUCH_OUT assert during the attempt?
 };
 
 // Fingerprint diagnostics: report the failure reason on the verify screen and
@@ -514,13 +515,19 @@ struct FpVerifyResult_t {
 // is the one thing that matters when asking whether a LIR2450 holds up under the
 // capture burst. Pinned to the core the FP task is not on.
 static constexpr BaseType_t VMON_TASK_CORE = 0;
-static volatile uint16_t s_vmin     = 0xFFFF;
-static volatile bool     s_vmon_run = false;
+static volatile uint16_t s_vmin       = 0xFFFF;
+static volatile bool     s_vmon_run   = false;
+static volatile bool     s_touch_seen = false;
 
 static void vmon_task(void*) {
     while (s_vmon_run) {
         uint16_t mv = battery_raw_mv();
         if (mv && mv < s_vmin) s_vmin = mv;
+        // TOUCH_OUT is the module's own coarse finger detector, on its own V_TOUCH
+        // supply and independent of the imaging path. If it asserts while GETIMAGE
+        // keeps answering 0x02 "no finger", the sensor knows a finger is there and
+        // simply cannot image it — which is a coupling problem, not a power one.
+        if (digitalRead(FP_TOUCH_PIN) == HIGH) s_touch_seen = true;
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     vTaskDelete(nullptr);
@@ -534,13 +541,21 @@ static bool             s_fp_showing_result  = false; // cross is playing
 static bool             s_fp_retry_after_cross = false; // retry if true, sleep if false
 static uint8_t          s_fp_attempts_left   = FP_MAX_ATTEMPTS;
 
-// Stop the rail monitor and stamp the collected diagnostics into res.
+// Snapshot the driver's confirm code and failure stage. Must run before any
+// further UART traffic: fp_led_off() and fp_sleep() issue their own commands and
+// overwrite lastCC, so calling this late reports the LED command's success (0x00)
+// instead of the failure being diagnosed.
+static void fp_diag_snap(FpVerifyResult_t &res) {
+    res.cc    = fp_last_cc();
+    res.stage = fp_last_stage();
+}
+
+// Stop the rail monitor and record the minimum it saw.
 static void fp_diag_finish(FpVerifyResult_t &res) {
-    res.cc     = fp_last_cc();
-    res.stage  = fp_last_stage();
     s_vmon_run = false;
     vTaskDelay(pdMS_TO_TICKS(12));          // let vmon_task observe the flag and exit
     res.v_min  = (s_vmin == 0xFFFF) ? 0 : s_vmin;
+    res.touch  = s_touch_seen;
 }
 
 static void fp_verify_task(void*) {
@@ -551,16 +566,19 @@ static void fp_verify_task(void*) {
     // Start the monitor before the sensor is powered so the minimum covers the
     // load-switch inrush as well as the capture burst.
     res.v_start = battery_raw_mv();
-    s_vmin      = 0xFFFF;
-    s_vmon_run  = true;
+    s_vmin       = 0xFFFF;
+    s_touch_seen = false;
+    s_vmon_run   = true;
     xTaskCreatePinnedToCore(vmon_task, "vmon", 2048, nullptr, 1, nullptr, VMON_TASK_CORE);
 
     res.init_ok = fp_init(2000);
     res.v_init  = battery_raw_mv();
+    fp_diag_snap(res);                  // covers the init-failure case
 
     if (res.init_ok) {
         fp_led_steady_blue();
         res.result = fp_verify(&res.id, FP_MATCH_TIMEOUT_MS);
+        fp_diag_snap(res);              // before fp_led_off()/fp_sleep() clobber lastCC
         if (res.result == FpResult::OK || res.result == FpResult::NO_MATCH) {
             fp_diag_finish(res);
             // Deliver the result immediately so the UI reacts without delay,
@@ -674,13 +692,14 @@ static void loop_fp_wake() {
             s_fp_got_result = true;
 #ifdef DEBUG_SERIAL
             Serial.printf("[FP] Verify: %s (id=%d, left=%d) | init=%s cc=0x%02X stage=%s | "
-                          "Vstart=%umV Vinit=%umV Vmin=%umV (sag %dmV)\n",
+                          "Vstart=%umV Vinit=%umV Vmin=%umV (sag %dmV) TOUCH_OUT=%s\n",
                 res.result == FpResult::OK ? "MATCH" :
                 res.result == FpResult::NO_MATCH ? "NO_MATCH" : "ERROR",
                 res.id, s_fp_attempts_left - 1,
                 res.init_ok ? "OK" : "FAIL", res.cc, res.stage,
                 res.v_start, res.v_init, res.v_min,
-                (int)res.v_start - (int)res.v_min);
+                (int)res.v_start - (int)res.v_min,
+                res.touch ? "ASSERTED" : "never");
 #endif
         }
     }
@@ -708,9 +727,9 @@ static void loop_fp_wake() {
 #if FP_DIAG_ON_SCREEN
             {
                 char dbg[128];
-                snprintf(dbg, sizeof(dbg), "%s cc=%02X\n%s\n%u>%u min %u mV",
+                snprintf(dbg, sizeof(dbg), "%s cc=%02X TCH=%c\n%s\n%u>%u min %u mV",
                          s_fp_last.init_ok ? "init ok" : "INIT FAIL",
-                         s_fp_last.cc, s_fp_last.stage,
+                         s_fp_last.cc, s_fp_last.touch ? 'Y' : 'N', s_fp_last.stage,
                          s_fp_last.v_start, s_fp_last.v_init, s_fp_last.v_min);
                 ui_fp_set_status(dbg);
             }
