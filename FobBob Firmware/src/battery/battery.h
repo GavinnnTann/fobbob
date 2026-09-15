@@ -17,3 +17,9 @@ void battery_init();
 
 // Sample the ADC (averaged) + read the charge-detect line.
 BatteryStatus battery_read();
+
+// Instantaneous pack voltage in mV — two ADC samples, no EMA, no I2C.
+// battery_read()'s smoothing deliberately erases momentary load sag; this does
+// not, so it is the one to use when the question is whether the cell collapses
+// under a burst (see the fingerprint rail monitor in main.cpp).
+uint16_t battery_raw_mv();

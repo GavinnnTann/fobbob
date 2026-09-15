@@ -7,17 +7,6 @@ static FingerprintModule s_fp(Serial2, FP_UART_RX, FP_UART_TX, FP_TOUCH_PIN, FP_
 namespace {
     enum class EnrollPhase : uint8_t { SCAN1, WAIT_LIFT, SCAN2 };
     EnrollPhase s_phase = EnrollPhase::SCAN1;
-
-#ifdef DEBUG_SERIAL
-    const char* stage_name(FpStage s) {
-        switch (s) {
-            case FpStage::CAPTURE: return "CAPTURE";
-            case FpStage::FEATURE: return "FEATURE";
-            case FpStage::SEARCH:  return "SEARCH";
-            default:               return "NONE";
-        }
-    }
-#endif
 }
 
 bool fp_init(uint32_t timeoutMs) {
@@ -37,6 +26,17 @@ void fp_sleep() {
     s_fp.sleep();
 }
 
+uint8_t fp_last_cc() { return s_fp.lastCC; }
+
+const char* fp_last_stage() {
+    switch (s_fp.lastStage) {
+        case FpStage::CAPTURE: return "CAPTURE";
+        case FpStage::FEATURE: return "FEATURE";
+        case FpStage::SEARCH:  return "SEARCH";
+        default:               return "NONE";
+    }
+}
+
 FpResult fp_verify(uint8_t *matched_id, uint32_t timeoutMs) {
     uint16_t score = 0;
     int16_t id = s_fp.matchFingerprint(score, timeoutMs);
@@ -47,7 +47,7 @@ FpResult fp_verify(uint8_t *matched_id, uint32_t timeoutMs) {
     if (id == -1) return FpResult::NO_MATCH;
 #ifdef DEBUG_SERIAL
     Serial.printf("[FP] verify ERROR — stage=%s lastCC=0x%02X\n",
-                  stage_name(s_fp.lastStage), s_fp.lastCC);
+                  fp_last_stage(), s_fp.lastCC);
 #endif
     return FpResult::ERROR;
 }

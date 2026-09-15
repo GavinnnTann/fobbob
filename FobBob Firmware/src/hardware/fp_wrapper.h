@@ -8,6 +8,14 @@
 bool         fp_init(uint32_t timeoutMs = 2000);
 void         fp_sleep();
 
+// ─── Diagnostics ─────────────────────────────────────────────────────────────
+// Last confirm code seen by the driver: 0x00 OK, 0x02 no finger, 0xFF no reply
+// at all, 0xFE reply arrived but failed its checksum. 0xFF vs 0xFE is the useful
+// split — nothing answering vs. something answering badly.
+uint8_t      fp_last_cc();
+// Stage the last verify gave up at, as a short string: NONE/CAPTURE/FEATURE/SEARCH.
+const char*  fp_last_stage();
+
 // Blocking verify. Returns OK on match, NO_MATCH if not found, ERROR on comm fail.
 FpResult     fp_verify(uint8_t *matched_id, uint32_t timeoutMs);
 

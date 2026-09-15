@@ -489,7 +489,42 @@ static bool     s_timesync_active   = false;
 static constexpr BaseType_t FP_TASK_CORE = 1;
 
 // ── Fingerprint verify — async (FreeRTOS task so display keeps pumping) ────
-struct FpVerifyResult_t { FpResult result; uint8_t id; };
+struct FpVerifyResult_t {
+    FpResult result;
+    uint8_t  id;
+    // ── Diagnostics, filled by fp_diag_finish() ──
+    bool        init_ok;   // did fp_init() complete a handshake?
+    uint8_t     cc;        // driver's last confirm code (0xFF none, 0xFE bad checksum)
+    const char* stage;     // stage a failed match gave up at (static string)
+    uint16_t    v_start;   // pack mV before the sensor was powered
+    uint16_t    v_init;    // pack mV immediately after fp_init()
+    uint16_t    v_min;     // lowest pack mV seen while the sensor was active
+};
+
+// Fingerprint diagnostics: report the failure reason on the verify screen and
+// hold it before sleeping. On battery there is no serial cable attached, so the
+// panel is the only channel that can say what actually failed. Set to 0 once the
+// fingerprint path is trusted again.
+#define FP_DIAG_ON_SCREEN      1
+#define FP_DIAG_HOLD_MS     6000
+
+// ── Fingerprint rail monitor ───────────────────────────────────────────────
+// Samples the pack voltage unfiltered while the sensor is powered and keeps the
+// minimum. battery_read()'s EMA exists to smooth momentary load sag away, which
+// is the one thing that matters when asking whether a LIR2450 holds up under the
+// capture burst. Pinned to the core the FP task is not on.
+static constexpr BaseType_t VMON_TASK_CORE = 0;
+static volatile uint16_t s_vmin     = 0xFFFF;
+static volatile bool     s_vmon_run = false;
+
+static void vmon_task(void*) {
+    while (s_vmon_run) {
+        uint16_t mv = battery_raw_mv();
+        if (mv && mv < s_vmin) s_vmin = mv;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    vTaskDelete(nullptr);
+}
 static QueueHandle_t    s_fp_queue           = nullptr;
 static uint32_t         s_fp_anim_trigger_ms = 0;   // when the latest anim cycle was triggered
 static uint32_t         s_fp_anim_end_ms     = 0;   // end of the current anim cycle
@@ -499,12 +534,35 @@ static bool             s_fp_showing_result  = false; // cross is playing
 static bool             s_fp_retry_after_cross = false; // retry if true, sleep if false
 static uint8_t          s_fp_attempts_left   = FP_MAX_ATTEMPTS;
 
+// Stop the rail monitor and stamp the collected diagnostics into res.
+static void fp_diag_finish(FpVerifyResult_t &res) {
+    res.cc     = fp_last_cc();
+    res.stage  = fp_last_stage();
+    s_vmon_run = false;
+    vTaskDelay(pdMS_TO_TICKS(12));          // let vmon_task observe the flag and exit
+    res.v_min  = (s_vmin == 0xFFFF) ? 0 : s_vmin;
+}
+
 static void fp_verify_task(void*) {
-    FpVerifyResult_t res = { FpResult::ERROR, 0 };
-    if (fp_init(2000)) {
+    FpVerifyResult_t res = {};
+    res.result = FpResult::ERROR;
+    res.stage  = "NONE";
+
+    // Start the monitor before the sensor is powered so the minimum covers the
+    // load-switch inrush as well as the capture burst.
+    res.v_start = battery_raw_mv();
+    s_vmin      = 0xFFFF;
+    s_vmon_run  = true;
+    xTaskCreatePinnedToCore(vmon_task, "vmon", 2048, nullptr, 1, nullptr, VMON_TASK_CORE);
+
+    res.init_ok = fp_init(2000);
+    res.v_init  = battery_raw_mv();
+
+    if (res.init_ok) {
         fp_led_steady_blue();
         res.result = fp_verify(&res.id, FP_MATCH_TIMEOUT_MS);
         if (res.result == FpResult::OK || res.result == FpResult::NO_MATCH) {
+            fp_diag_finish(res);
             // Deliver the result immediately so the UI reacts without delay,
             // THEN let the sensor's own green/red flash finish before going dark.
             xQueueSend(s_fp_queue, &res, portMAX_DELAY);
@@ -528,6 +586,7 @@ static void fp_verify_task(void*) {
         // the silently-respawned verify task never overlaps us on the UART.
         fp_led_off();
     }
+    fp_diag_finish(res);
     xQueueSend(s_fp_queue, &res, portMAX_DELAY);
     vTaskDelete(nullptr);
 }
@@ -614,10 +673,14 @@ static void loop_fp_wake() {
             s_fp_last       = res;
             s_fp_got_result = true;
 #ifdef DEBUG_SERIAL
-            Serial.printf("[FP] Verify: %s (id=%d, attempts_left=%d)\n",
+            Serial.printf("[FP] Verify: %s (id=%d, left=%d) | init=%s cc=0x%02X stage=%s | "
+                          "Vstart=%umV Vinit=%umV Vmin=%umV (sag %dmV)\n",
                 res.result == FpResult::OK ? "MATCH" :
                 res.result == FpResult::NO_MATCH ? "NO_MATCH" : "ERROR",
-                res.id, s_fp_attempts_left - 1);
+                res.id, s_fp_attempts_left - 1,
+                res.init_ok ? "OK" : "FAIL", res.cc, res.stage,
+                res.v_start, res.v_init, res.v_min,
+                (int)res.v_start - (int)res.v_min);
 #endif
         }
     }
@@ -642,6 +705,16 @@ static void loop_fp_wake() {
             ui_fp_verify_result(false);
         } else {
             // ERROR: timeout (no finger placed) or comm failure — silent restart
+#if FP_DIAG_ON_SCREEN
+            {
+                char dbg[128];
+                snprintf(dbg, sizeof(dbg), "%s cc=%02X\n%s\n%u>%u min %u mV",
+                         s_fp_last.init_ok ? "init ok" : "INIT FAIL",
+                         s_fp_last.cc, s_fp_last.stage,
+                         s_fp_last.v_start, s_fp_last.v_init, s_fp_last.v_min);
+                ui_fp_set_status(dbg);
+            }
+#endif
             if (s_fp_attempts_left > 0) {
                 ui_fp_anim_trigger();
                 s_fp_anim_trigger_ms = millis();
@@ -649,6 +722,13 @@ static void loop_fp_wake() {
                 s_fp_queue = xQueueCreate(1, sizeof(FpVerifyResult_t));
                 xTaskCreatePinnedToCore(fp_verify_task, "fp_verify", 4096, nullptr, 2, nullptr, FP_TASK_CORE);
             } else {
+#if FP_DIAG_ON_SCREEN
+                uint32_t until = millis() + FP_DIAG_HOLD_MS;   // long enough to read
+                while ((int32_t)(until - millis()) > 0) {
+                    display_tick();
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+#endif
                 fp_sleep();
                 power_go_to_sleep();
             }
