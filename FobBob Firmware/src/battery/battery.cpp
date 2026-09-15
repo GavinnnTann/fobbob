@@ -47,6 +47,12 @@ void battery_init() {
     s_filt_mv = -1;                                  // re-seed the filter on next read
 }
 
+uint16_t battery_raw_mv() {
+    uint32_t sum = analogReadMilliVolts(BAT_ADC_PIN);
+    sum         += analogReadMilliVolts(BAT_ADC_PIN);
+    return (uint16_t)((sum / 2) * 2);   // /2 samples, x2 for the 100k:100k divider
+}
+
 BatteryStatus battery_read() {
     // Stage 1: average a handful of samples to settle ADC noise.
     uint32_t sum = 0;

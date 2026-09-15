@@ -220,21 +220,42 @@ FingerprintModule::FingerprintModule(HardwareSerial &serial,
 
 bool FingerprintModule::begin(uint32_t baud) {
     if (_touchPin >= 0) pinMode(_touchPin, INPUT);
-    if (_pwrPin   >= 0) pinMode(_pwrPin, OUTPUT);
+    // _pwrPin is deliberately left alone here — powerOn() owns it and has already
+    // raised it. The pinMode(OUTPUT) that used to live on this line was what
+    // actually switched the sensor on, 200 ms later than intended (see powerOn).
     _serial.begin(baud, SERIAL_8N1, _rxPin, _txPin);
-    delay(200);
-    return verifyPassword(0);
+    delay(FP_UART_SETTLE_MS);
+
+    // Retry the handshake rather than trusting one packet: a dropped or garbled
+    // response is not proof the module is absent — it may still be finishing its
+    // power-on self-test.
+    for (uint8_t i = 0; i < FP_HANDSHAKE_RETRIES; i++) {
+        if (verifyPassword(0)) return true;
+        delay(FP_HANDSHAKE_RETRY_MS);
+    }
+    return false;
 }
 
 void FingerprintModule::powerOn() {
-    if (_pwrPin >= 0) {
-        digitalWrite(_pwrPin, HIGH);
-        delay(200);
-    }
+    if (_pwrPin < 0) return;
+    // pinMode() must precede digitalWrite(). On this core (Arduino-ESP32 2.0.9)
+    // digitalWrite() is a bare gpio_set_level(): it sets the output register while
+    // the pad's driver is still disabled, so the pin does not actually go HIGH
+    // until begin() calls pinMode(OUTPUT). The settle below was therefore spent on
+    // a rail that was still down, leaving the ZW101 only the 200 ms inside begin()
+    // between VCC rising and the first packet — about its power-on-ready figure,
+    // and the first thing to give way on a slower, battery-fed rail. Configuring
+    // the pad first makes the settle real. Arduino-ESP32 3.x requires this order
+    // outright: there, a digitalWrite() to an unregistered pad is silently dropped.
+    pinMode(_pwrPin, OUTPUT);
+    digitalWrite(_pwrPin, HIGH);
+    delay(FP_POWER_SETTLE_MS);
 }
 
 void FingerprintModule::powerOff() {
-    if (_pwrPin >= 0) digitalWrite(_pwrPin, LOW);
+    if (_pwrPin < 0) return;
+    pinMode(_pwrPin, OUTPUT);   // keep the pad configured before writing (see powerOn)
+    digitalWrite(_pwrPin, LOW);
 }
 
 bool FingerprintModule::isFingerPresent() {
@@ -360,16 +381,34 @@ int16_t FingerprintModule::enrollFingerprint(uint16_t id, uint32_t timeoutMs) {
 
 int16_t FingerprintModule::matchFingerprint(uint16_t &score, uint32_t timeoutMs) {
     uint32_t deadline = millis() + timeoutMs;
+    lastStage = FpStage::NONE;
 
-    // Poll for finger — delay between attempts to yield CPU to the display task
-    while (millis() < deadline) {
-        if (getImage()) break;
-        if (lastCC != 0x02) return -2;
-        delay(20);
+    // Poll for finger — delay between attempts to yield CPU to the display task.
+    // comm_errs absorbs isolated 0xFF/0xFE responses (see FP_COMM_RETRIES): one
+    // glitched byte or a momentary dip on the sensor's rail used to abort the
+    // whole verify, which made a marginal supply look like a dead sensor.
+    bool     captured  = false;
+    uint8_t  comm_errs = 0;
+    while ((int32_t)(deadline - millis()) > 0) {
+        if (getImage()) { captured = true; break; }
+        if (lastCC == 0x02) {            // no finger on the pad yet
+            comm_errs = 0;
+            delay(20);
+            continue;
+        }
+        if ((lastCC == 0xFF || lastCC == 0xFE) && ++comm_errs <= FP_COMM_RETRIES) {
+            delay(FP_COMM_RETRY_MS);
+            continue;
+        }
+        lastStage = FpStage::CAPTURE;    // real module-level error, or retries spent
+        return -2;
     }
-    if (millis() >= deadline) return -2;
+    // Distinguish a timeout from a frame that landed on the final poll: the old
+    // `millis() >= deadline` recheck discarded a good capture taken right on the
+    // deadline and reported it as an error.
+    if (!captured) { lastStage = FpStage::CAPTURE; return -2; }
 
-    if (!image2Tz(1)) return -2;
+    if (!image2Tz(1)) { lastStage = FpStage::FEATURE; return -2; }
 
     // HiSpeedSearch across all 50 slots (count = 0x00A3 = 163, covers all with margin)
     uint8_t p[5] = { 0x01, 0x00, 0x00, 0x00, 0xA3 };
@@ -386,7 +425,9 @@ int16_t FingerprintModule::matchFingerprint(uint16_t &score, uint32_t timeoutMs)
         score = ((uint16_t)dout[2] << 8) | dout[3];
         return (int16_t)matchId;
     }
-    return (cc == 0x09) ? -1 : -2;  // 0x09 = not found; anything else = error
+    if (cc == 0x09) return -1;      // 0x09 = no match against any stored template
+    lastStage = FpStage::SEARCH;
+    return -2;
 }
 
 // ─── Deletion ─────────────────────────────────────────────────────────────────

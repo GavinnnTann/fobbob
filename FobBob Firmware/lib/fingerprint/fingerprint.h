@@ -8,6 +8,31 @@
 enum class FpEnrollStep : uint8_t { PLACE_FIRST, LIFT_FINGER, PLACE_SECOND, DONE, FAILED };
 enum class FpResult     : uint8_t { OK, NO_MATCH, ERROR };
 
+// Stage at which the last matchFingerprint() call gave up. Purely diagnostic —
+// it tells a failed verify apart from a sensor that never came up, which is the
+// difference between a firmware bug and a supply problem.
+enum class FpStage : uint8_t {
+    NONE,       // no failure recorded
+    CAPTURE,    // GETIMAGE never returned a usable frame
+    FEATURE,    // IMAGE2TZ failed on the captured frame
+    SEARCH,     // HISPEEDSEARCH/SEARCH failed
+};
+
+// ─── Timing ──────────────────────────────────────────────────────────────────
+// The ZW101's power-on self-test needs ~200 ms before it will answer on the UART,
+// and that is a typical figure, not a guaranteed one — a slower VCC rise (softer
+// supply, bigger bulk cap behind the load switch) pushes it out. 400 ms gives the
+// module real margin instead of racing its own datasheet number.
+#define FP_POWER_SETTLE_MS      400   // after VCC switch-on, before talking to it
+#define FP_UART_SETTLE_MS       200   // after _serial.begin(), before the handshake
+#define FP_HANDSHAKE_RETRIES      3   // verifyPassword attempts in begin()
+#define FP_HANDSHAKE_RETRY_MS   150   // gap between handshake attempts
+// A single 0xFF (no response) or 0xFE (bad checksum) is a glitched byte or a
+// momentary supply dip, not a dead sensor. Tolerate a few during the capture poll
+// so one bad packet can't fail an entire verify.
+#define FP_COMM_RETRIES           3
+#define FP_COMM_RETRY_MS         30
+
 // ─── LED color wire values for AURALEDCONFIG (0x3C) ──────────────────────────
 // These are the actual bytes sent to the module, NOT UI label numbers.
 #define FP_LED_BLUE    0x01
@@ -32,7 +57,11 @@ enum class FpResult     : uint8_t { OK, NO_MATCH, ERROR };
 class FingerprintModule {
 public:
     // Last confirm code returned by the module (0x00 = OK; see fingerprint.md §7)
+    // 0xFF = no response at all, 0xFE = response arrived but failed the checksum.
     uint8_t lastCC = 0;
+
+    // Where the last matchFingerprint() gave up (see FpStage).
+    FpStage lastStage = FpStage::NONE;
 
     // ── Construction / init ────────────────────────────────────────────────────
     FingerprintModule(HardwareSerial &serial,
